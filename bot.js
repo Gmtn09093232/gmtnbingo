@@ -18,7 +18,6 @@ async function ensureUser(telegramId, username) {
         )
         .select()
         .single();
-
     if (error) {
         console.error("ensureUser error:", error);
         return null;
@@ -26,15 +25,11 @@ async function ensureUser(telegramId, username) {
     return data;
 }
 
-// Start command
 bot.start(async (ctx) => {
     const telegramId = ctx.from.id;
     const username = ctx.from.username || "player";
     const user = await ensureUser(telegramId, username);
-    if (!user) {
-        return ctx.reply("❌ Database error. Please try later.");
-    }
-
+    if (!user) return ctx.reply("❌ Database error.");
     ctx.reply(
         `Welcome ${username}\nBalance: ${user.balance}`,
         {
@@ -61,17 +56,12 @@ bot.hears("🎮 Play", (ctx) => {
 });
 
 bot.hears("💰 Balance", async (ctx) => {
-    const telegramId = ctx.from.id;
-    const { data, error } = await supabase
+    const { data } = await supabase
         .from('users')
         .select('balance')
-        .eq('telegram_id', telegramId)
+        .eq('telegram_id', ctx.from.id)
         .single();
-
-    if (error || !data) {
-        return ctx.reply("❌ Could not fetch balance.");
-    }
-    ctx.reply(`💰 Balance: ${data.balance}`);
+    ctx.reply(`💰 Balance: ${data?.balance || 0}`);
 });
 
 // Deposit / Withdraw state
@@ -87,7 +77,6 @@ bot.hears("➖ Withdraw", (ctx) => {
     ctx.reply("Enter withdraw amount:");
 });
 
-// Handle amount input
 bot.on("text", async (ctx) => {
     const action = userStates.get(ctx.from.id);
     if (!action) return;
@@ -101,159 +90,37 @@ bot.on("text", async (ctx) => {
     const telegramId = ctx.from.id;
 
     if (action === "withdraw") {
-        const { data, error } = await supabase
+        const { data } = await supabase
             .from('users')
             .select('balance')
             .eq('telegram_id', telegramId)
             .single();
-
-        const balance = data?.balance || 0;
-        if (balance < amount) {
+        if ((data?.balance || 0) < amount) {
             userStates.delete(ctx.from.id);
             return ctx.reply("❌ Not enough balance");
         }
     }
 
-    // Create request in Supabase table "requests"
-    const { error } = await supabase
-        .from('requests')
-        .insert({
-            user_id: telegramId,
-            type: action,
-            amount: amount,
-            status: 'pending'
-        });
+    const { error } = await supabase.from('requests').insert({
+        user_id: telegramId,
+        type: action,
+        amount: amount,
+        status: 'pending'
+    });
 
     if (error) {
-        console.error("Insert request error:", error);
-        return ctx.reply("❌ Could not create request. Please try again.");
+        console.error("Insert error:", error);
+        return ctx.reply("❌ Could not create request.");
     }
 
     ctx.reply(`✅ Request sent: ${action} ${amount}. Awaiting admin approval.`);
     userStates.delete(ctx.from.id);
 });
 
-// ----- Admin approval handlers (using direct balance updates) -----
-
-// Approve handler
-bot.action(/approve_(\d+)/, async (ctx) => {
-    if (ctx.from.id !== ADMIN_ID) {
-        return ctx.answerCbQuery("Not allowed");
-    }
-
-    const requestId = parseInt(ctx.match[1]);
-    console.log(`Admin approving request ${requestId}`);
-
-    // Use a transaction-like approach with retry logic
-    try {
-        // 1. Fetch the pending request
-        const { data: reqData, error: fetchError } = await supabase
-            .from('requests')
-            .select('*')
-            .eq('id', requestId)
-            .eq('status', 'pending')
-            .single();
-
-        if (fetchError || !reqData) {
-            await ctx.answerCbQuery("Request not found or already processed");
-            return;
-        }
-
-        const req = reqData;
-
-        // 2. Update user balance directly
-        let balanceUpdateError = null;
-        if (req.type === 'deposit') {
-            const { error } = await supabase
-                .from('users')
-                .update({ balance: supabase.raw('balance + ?', req.amount) })
-                .eq('telegram_id', req.user_id);
-            balanceUpdateError = error;
-        } else if (req.type === 'withdraw') {
-            // First check balance again
-            const { data: userData } = await supabase
-                .from('users')
-                .select('balance')
-                .eq('telegram_id', req.user_id)
-                .single();
-            if (!userData || userData.balance < req.amount) {
-                await ctx.answerCbQuery("Insufficient balance");
-                await ctx.editMessageText("❌ Insufficient balance for withdrawal");
-                return;
-            }
-            const { error } = await supabase
-                .from('users')
-                .update({ balance: supabase.raw('balance - ?', req.amount) })
-                .eq('telegram_id', req.user_id);
-            balanceUpdateError = error;
-        }
-
-        if (balanceUpdateError) {
-            console.error("Balance update error:", balanceUpdateError);
-            await ctx.answerCbQuery("Error updating balance");
-            await ctx.editMessageText("❌ Error processing request");
-            return;
-        }
-
-        // 3. Mark request as approved
-        await supabase
-            .from('requests')
-            .update({ status: 'approved' })
-            .eq('id', requestId);
-
-        // 4. Notify user
-        await bot.telegram.sendMessage(req.user_id, `✅ Your ${req.type} of ${req.amount} has been approved.`);
-
-        // 5. Update the admin message
-        await ctx.editMessageText(`✅ Request #${requestId} approved.`);
-        await ctx.answerCbQuery("Approved");
-    } catch (err) {
-        console.error("Approval error:", err);
-        await ctx.answerCbQuery("Internal error");
-        await ctx.editMessageText("❌ Something went wrong");
-    }
-});
-
-// Reject handler
-bot.action(/reject_(\d+)/, async (ctx) => {
-    if (ctx.from.id !== ADMIN_ID) {
-        return ctx.answerCbQuery("Not allowed");
-    }
-
-    const requestId = parseInt(ctx.match[1]);
-
-    // Update request status to rejected
-    const { error } = await supabase
-        .from('requests')
-        .update({ status: 'rejected' })
-        .eq('id', requestId);
-
-    if (error) {
-        console.error("Reject error:", error);
-        await ctx.answerCbQuery("Error rejecting");
-        await ctx.editMessageText("❌ Error rejecting request");
-        return;
-    }
-
-    // Notify user
-    const { data: reqData } = await supabase
-        .from('requests')
-        .select('user_id')
-        .eq('id', requestId)
-        .single();
-
-    if (reqData) {
-        await bot.telegram.sendMessage(reqData.user_id, `❌ Your request has been rejected.`);
-    }
-
-    await ctx.editMessageText(`❌ Request #${requestId} rejected.`);
-    await ctx.answerCbQuery("Rejected");
-});
-
-// Admin command to show pending requests
+// ---------- ADMIN: Show pending requests ----------
 bot.command('pending', async (ctx) => {
     if (ctx.from.id !== ADMIN_ID) {
-        return ctx.reply("⛔ You are not authorized to use this command.");
+        return ctx.reply("⛔ You are not the admin.");
     }
 
     const { data: requests, error } = await supabase
@@ -263,8 +130,8 @@ bot.command('pending', async (ctx) => {
         .order('id', { ascending: true });
 
     if (error) {
-        console.error("Pending query error:", error);
-        return ctx.reply("❌ Database error");
+        console.error("Pending error:", error);
+        return ctx.reply("❌ Database error.");
     }
 
     if (!requests || requests.length === 0) {
@@ -282,13 +149,114 @@ bot.command('pending', async (ctx) => {
     }
 });
 
-// Launch bot
-bot.launch().then(() => {
-    console.log("🤖 Bot running...");
-}).catch(err => {
-    console.error("Bot launch error:", err);
+// ---------- ADMIN: Approve ----------
+bot.action(/approve_(\d+)/, async (ctx) => {
+    if (ctx.from.id !== ADMIN_ID) {
+        return ctx.answerCbQuery("Not admin");
+    }
+
+    const requestId = parseInt(ctx.match[1]);
+    console.log(`Admin approving request ${requestId}`);
+
+    // Fetch request
+    const { data: req, error: fetchErr } = await supabase
+        .from('requests')
+        .select('*')
+        .eq('id', requestId)
+        .eq('status', 'pending')
+        .single();
+
+    if (fetchErr || !req) {
+        await ctx.answerCbQuery("Request not found");
+        return;
+    }
+
+    // Get current user balance
+    const { data: user, error: userErr } = await supabase
+        .from('users')
+        .select('balance')
+        .eq('telegram_id', req.user_id)
+        .single();
+
+    if (userErr) {
+        console.error("User fetch error:", userErr);
+        await ctx.answerCbQuery("User not found");
+        return;
+    }
+
+    let newBalance = user.balance;
+    if (req.type === 'deposit') {
+        newBalance += req.amount;
+    } else if (req.type === 'withdraw') {
+        if (user.balance < req.amount) {
+            await ctx.answerCbQuery("Insufficient balance");
+            await ctx.editMessageText("❌ Insufficient balance for withdrawal");
+            return;
+        }
+        newBalance -= req.amount;
+    }
+
+    // Update balance
+    const { error: updateErr } = await supabase
+        .from('users')
+        .update({ balance: newBalance })
+        .eq('telegram_id', req.user_id);
+
+    if (updateErr) {
+        console.error("Balance update error:", updateErr);
+        await ctx.answerCbQuery("Error updating balance");
+        return;
+    }
+
+    // Mark request as approved
+    await supabase
+        .from('requests')
+        .update({ status: 'approved' })
+        .eq('id', requestId);
+
+    // Notify user
+    await bot.telegram.sendMessage(
+        req.user_id,
+        `✅ Your ${req.type} of ${req.amount} has been approved. New balance: ${newBalance}`
+    );
+
+    await ctx.editMessageText(`✅ Request #${requestId} approved.`);
+    await ctx.answerCbQuery("Approved");
 });
 
-// Enable graceful stop
-process.once('SIGINT', () => bot.stop('SIGINT'));
-process.once('SIGTERM', () => bot.stop('SIGTERM'));
+// ---------- ADMIN: Reject ----------
+bot.action(/reject_(\d+)/, async (ctx) => {
+    if (ctx.from.id !== ADMIN_ID) {
+        return ctx.answerCbQuery("Not admin");
+    }
+
+    const requestId = parseInt(ctx.match[1]);
+
+    const { error } = await supabase
+        .from('requests')
+        .update({ status: 'rejected' })
+        .eq('id', requestId);
+
+    if (error) {
+        console.error("Reject error:", error);
+        await ctx.answerCbQuery("Error");
+        return;
+    }
+
+    // Get user_id to notify
+    const { data: req } = await supabase
+        .from('requests')
+        .select('user_id')
+        .eq('id', requestId)
+        .single();
+
+    if (req) {
+        await bot.telegram.sendMessage(req.user_id, `❌ Your request has been rejected.`);
+    }
+
+    await ctx.editMessageText(`❌ Request #${requestId} rejected.`);
+    await ctx.answerCbQuery("Rejected");
+});
+
+bot.launch();
+console.log("🤖 Bot running...");
