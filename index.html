@@ -1,0 +1,144 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0, viewport-fit=cover">
+    <title>Casino Bingo Pro</title>
+    <script src="https://telegram.org/js/telegram-web-app.js"></script>
+    <script src="/socket.io/socket.io.js"></script>
+    <style>
+        * { box-sizing: border-box; -webkit-user-select: none; user-select: none;}
+        body { margin:0; font-family: system-ui; background: radial-gradient(circle at top, #0d1b2a, #05080f); color:#fff; padding:15px; }
+        .container { max-width:1200px; margin:auto; }
+        .hidden { display:none; }
+        .card { background:#14202b; padding:10px; border-radius:10px; }
+        .auth, .game { background:#111b27; padding:20px; border-radius:20px; }
+        .balance { display:flex; justify-content:space-between; padding:10px; background:#0a1620; border-radius:12px; margin-bottom:10px; }
+        button { border:none; padding:8px 12px; border-radius:12px; cursor:pointer; }
+        .primary { background:#f39c12; }
+        .danger { background:#c0392b; }
+        .grid { display:grid; grid-template-columns:repeat(10,1fr); gap:6px; margin-top:10px; }
+        .cell { background:#1b2a38; padding:10px; text-align:center; border-radius:8px; cursor:pointer; transition:0.1s; }
+        .cell.taken { background:#7f2a2a; opacity:0.5; cursor:not-allowed; }
+        .cell.selected { background:#f39c12; box-shadow:0 0 5px gold; }
+        .status { margin:10px 0; font-weight:bold; color:#ffd966; }
+        .error { color:#ff8888; }
+    </style>
+</head>
+<body>
+<div class="container">
+    <div id="auth" class="auth">
+        <h2>🎰 Casino Bingo Pro</h2>
+        <p id="error" class="error"></p>
+    </div>
+    <div id="game" class="game hidden">
+        <div class="balance">
+            <span>💰 Balance: <b id="bal">0</b></span>
+            <button class="danger" id="logout">Logout</button>
+        </div>
+        <div class="status" id="status">Connecting...</div>
+        <h3>Pick Your Number (cost: 10)</h3>
+        <div id="grid" class="grid"></div>
+    </div>
+</div>
+
+<script>
+    const tg = window.Telegram.WebApp;
+    tg.ready();
+    tg.expand();
+
+    let socket;
+    let user = null;
+    let selected = null;
+    let locked = false;
+    let availableSet = new Set();
+
+    // DOM elements
+    const authDiv = document.getElementById("auth");
+    const gameDiv = document.getElementById("game");
+    const balSpan = document.getElementById("bal");
+    const gridDiv = document.getElementById("grid");
+    const statusDiv = document.getElementById("status");
+    const errorP = document.getElementById("error");
+
+    async function login() {
+        const initData = tg.initData;
+        if (!initData) {
+            errorP.innerText = "Open inside Telegram";
+            return;
+        }
+        const res = await fetch("/api/auth", {
+            method: "POST",
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify({ initData })
+        });
+        const data = await res.json();
+        if (!data.success) {
+            errorP.innerText = "Login failed";
+            return;
+        }
+        user = { userId: data.userId, username: data.username };
+        balSpan.innerText = data.balance;
+        connectSocket();
+        showGame();
+    }
+
+    function showGame() {
+        authDiv.classList.add("hidden");
+        gameDiv.classList.remove("hidden");
+    }
+
+    function connectSocket() {
+        socket = io();
+        socket.on("connect", () => statusDiv.innerText = "🟢 Connected");
+        socket.on("disconnect", () => statusDiv.innerText = "🔴 Disconnected");
+        socket.on("balanceUpdate", (b) => balSpan.innerText = b);
+        socket.on("gameState", (state) => {
+            locked = state.locked;
+            availableSet = new Set(state.available || []);
+            renderGrid();
+            statusDiv.innerText = locked ? "🔒 Round locked - waiting for winner" : "🟢 Choose a number";
+        });
+        socket.on("cardAssigned", (data) => {
+            selected = data.cardNumber;
+            balSpan.innerText = data.balance;
+            renderGrid();
+            statusDiv.innerText = `✅ You picked number ${data.cardNumber}`;
+        });
+        socket.on("statusMessage", (msg) => {
+            statusDiv.innerText = msg.text;
+        });
+        socket.on("numberDrawn", (data) => {
+            statusDiv.innerText = `🎲 Winning number: ${data.number}`;
+        });
+        socket.on("error", (err) => {
+            statusDiv.innerText = `❌ ${err.message}`;
+        });
+    }
+
+    function renderGrid() {
+        gridDiv.innerHTML = "";
+        for (let i = 1; i <= 100; i++) {
+            const cell = document.createElement("div");
+            cell.className = "cell";
+            if (!availableSet.has(i)) cell.classList.add("taken");
+            if (selected === i) cell.classList.add("selected");
+            cell.innerText = i;
+            cell.onclick = () => {
+                if (locked) return statusDiv.innerText = "Round locked, wait for next round";
+                if (!availableSet.has(i)) return statusDiv.innerText = "Number already taken";
+                socket.emit("selectCard", { cardNumber: i, name: user.username });
+            };
+            gridDiv.appendChild(cell);
+        }
+    }
+
+    document.getElementById("logout").onclick = async () => {
+        await fetch("/api/logout", { method: "POST" });
+        location.reload();
+    };
+
+    login();
+</script>
+</body>
+</html>
