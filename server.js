@@ -39,31 +39,38 @@ function verifyTelegram(initData) {
 
 // ---------- Auth endpoint ----------
 app.post("/api/auth", async (req, res) => {
-    console.log("🔐 Auth request received");
-    console.log("BOT_TOKEN present?", !!process.env.BOT_TOKEN);
-    console.log("InitData (first 100 chars):", req.body.initData?.substring(0, 100));
-
     const { initData } = req.body;
-    if (!initData) {
-        console.log("❌ No initData");
-        return res.status(400).json({ error: "No initData" });
-    }
-
-    const isValid = verifyTelegram(initData);
-    console.log("Hash verification result:", isValid);
-
-    if (!isValid) {
-        console.log("❌ Invalid auth - hash mismatch");
+    if (!initData || !verifyTelegram(initData)) {
         return res.status(403).json({ error: "Invalid auth" });
     }
-
     const params = new URLSearchParams(initData);
     const userData = JSON.parse(params.get("user"));
     const telegramId = userData.id;
     const username = userData.username || userData.first_name;
 
-    console.log(`✅ User ${telegramId} (${username}) authenticated`);
+    // Upsert user into Supabase
+    const { data, error } = await supabase
+        .from('users')
+        .upsert([
+            { telegram_id: telegramId, username: username }
+        ], {
+            onConflict: 'telegram_id'
+        })
+        .select();
 
+    if (error) {
+        console.error("Auth upsert error:", error);
+        return res.status(500).json({ error: error.message });
+    }
+
+    const user = data[0];
+    req.session.userId = telegramId;
+    res.json({
+        success: true,
+        userId: user.telegram_id,
+        username: user.username,
+        balance: user.balance || 0
+    });
 });
 
 // ---------- Bingo Game State (in-memory + Supabase on win) ----------
